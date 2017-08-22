@@ -1,122 +1,78 @@
 package org.elasticsearch.plugin.elasticfence;
 
+import com.google.common.net.HttpHeaders;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.logging.log4j.Logger;
 import org.elasticsearch.client.node.NodeClient;
+import org.elasticsearch.common.bytes.BytesArray;
+import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.logging.ESLoggerFactory;
+import org.elasticsearch.plugin.elasticfence.provider.AuthProvider;
+import org.elasticsearch.plugin.elasticfence.provider.Credentials;
 import org.elasticsearch.rest.*;
 
-import org.elasticsearch.client.Client;
-import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.plugin.elasticfence.data.UserDataBridge;
-import org.elasticsearch.plugin.elasticfence.logger.EFLogger;
+import java.util.List;
 
-import java.io.IOException;
+public class AuthRestHandler implements RestHandler {
+    private static final Logger LOG = ESLoggerFactory.getLogger("plugin.elasticfence");
 
-import static org.elasticsearch.rest.RestRequest.Method.GET;
-import static org.elasticsearch.rest.RestStatus.OK;
-import static org.elasticsearch.rest.RestStatus.CONFLICT;
-import static org.elasticsearch.rest.RestStatus.SERVICE_UNAVAILABLE;
+    private final RestHandler restHandler;
+    private final List<AuthProvider> authProviders;
 
-public class AuthRestHandler extends BaseRestHandler {
-    @Inject
-    public AuthRestHandler(Settings settings, RestController restController, Client client) {
-        super(settings);
-        restController.registerHandler(GET, "/_httpuserauth", this);
-        RestFilter filter = new AuthRestFilter(client, settings);
-        restController.registerFilter(filter);
+    public AuthRestHandler(RestHandler restHandler, List<AuthProvider> authProviders) {
+        this.restHandler = restHandler;
+        this.authProviders = authProviders;
     }
 
-	@Override
-	protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-		String mode = request.param("mode");
-		if (mode == null) {
-			return channel -> channel.sendResponse(new BytesRestResponse(OK, "No Method"));
-		}
+    @Override
+    public void handleRequest(RestRequest request, RestChannel channel, NodeClient client) throws Exception {
+        if (accept(request)) {
+            restHandler.handleRequest(request, channel, client);
+        } else {
+            channel.sendResponse(new RestResponse() {
 
-        UserDataBridge userDataBridge = new UserDataBridge(client, ElasticfenceSettings.SETTING_AUTH_NUMBER_OF_SHARDS, ElasticfenceSettings.SETTING_AUTH_NUMBER_OF_REPLICAS);
-		if (!userDataBridge.isInitialized()) {
-			return channel -> channel.sendResponse(new BytesRestResponse(SERVICE_UNAVAILABLE, "http user auth initializing..."));
-		}
-		if ("list".equals(mode)) {
-			try {
-				String userListJSON = userDataBridge.listUser();
-				return channel -> channel.sendResponse(new BytesRestResponse(OK, userListJSON));
-			} catch (Exception ex) {
-				EFLogger.error("failed to create index: ", ex);
-				return channel -> channel.sendResponse(new BytesRestResponse(OK, "failed to list all users"));
-			}
-		}
-		if ("adduser".equals(mode)) {
-			String userName = request.param("username");
-			String password = request.param("password");
-			try {
-				boolean res = userDataBridge.createUser(userName, password);
-				if (res) {
-					return channel -> channel.sendResponse(new BytesRestResponse(OK, "User created : " + userName));
-				} else {
-					return channel -> channel.sendResponse(new BytesRestResponse(CONFLICT, "User already exists : " + userName));
-				}
-			} catch (Exception ex) {
-				EFLogger.error("failed to create index: ", ex);
-				return channel -> channel.sendResponse(new BytesRestResponse(OK, "failed to create index : " + userName));
-			}
-		}
-		if ("addindex".equals(mode)) {
-			String userName  = request.param("username");
-			String indexName = request.param("index");
+                @Override
+                public RestStatus status() {
+                    return RestStatus.UNAUTHORIZED;
+                }
 
-			try {
-				boolean res = userDataBridge.addAuthIndex(userName, indexName);
-				if (res) {
-					return channel -> channel.sendResponse(new BytesRestResponse(OK, "added auth index: " + userName));
-				} else {
-					return channel -> channel.sendResponse(new BytesRestResponse(OK, "failed to add auth index: " + userName));
-				}
-			} catch (Exception ex) {
-				EFLogger.error("failed to add auth index: ", ex);
-				return channel -> channel.sendResponse(new BytesRestResponse(OK, "failed to add auth index : " + userName));
-			}
-		}
+                @Override
+                public String contentType() {
+                    return "application/json";
+                }
 
-		if ("updateindex".equals(mode)) {
-			String userName  = request.param("username");
-			String indexName = request.param("index");
+                @Override
+                public BytesReference content() {
+                    return new BytesArray("");
+                }
+            });
+        }
+    }
 
-			try {
-				boolean res = userDataBridge.updateAuthIndex(userName, indexName);
-				if (res) {
-					return channel -> channel.sendResponse(new BytesRestResponse(OK, "added auth index: " + userName));
-				} else {
-					return channel -> channel.sendResponse(new BytesRestResponse(OK, "failed to add auth index: " + userName));
-				}
-			} catch (Exception ex) {
-				EFLogger.error("failed to add auth index: ", ex);
-				return channel -> channel.sendResponse(new BytesRestResponse(OK, "failed to add auth index : " + userName));
-			}
-		}
+    private boolean accept(RestRequest request) {
+        List<String> authValues = request.getAllHeaderValues(HttpHeaders.AUTHORIZATION);
+        if (CollectionUtils.size(authValues) != 1) {
+            LOG.info("auth fail ! - not found authorization header - REMOTE:{}", request.getRemoteAddress());
+            return false;
+        }
 
-		if ("passwd".equals(mode)) {
-			String userName = request.param("username");
-			String oldPassword = request.param("old_password");
-			String newPassword = request.param("new_password");
-
-			boolean res = userDataBridge.changePassword(userName, oldPassword, newPassword);
-			if (res) {
-				return channel -> channel.sendResponse(new BytesRestResponse(OK, "Password changed : " + userName));
-			} else {
-				return channel -> channel.sendResponse(new BytesRestResponse(OK, "Failed to change Password: " + userName));
-			}
-		}
-
-		if ("deleteuser".equals(mode)) {
-			String userName  = request.param("username");
-
-			boolean res = userDataBridge.deleteUser(userName);
-			if (res) {
-				return channel -> channel.sendResponse(new BytesRestResponse(OK, "deleted user: " + userName));
-			} else {
-				return channel -> channel.sendResponse(new BytesRestResponse(OK, "failed to delete user: " + userName));
-			}
-		}
-		return channel -> channel.sendResponse(new BytesRestResponse(OK, "Failed"));
-	}
+        Credentials credentials = null;
+        for (AuthProvider provider : authProviders) {
+            try {
+                credentials = provider.authenticate(authValues.get(0));
+                if (credentials != null) {
+                    break;
+                }
+            } catch (Exception e) {
+                LOG.error("provider error ! - skip this provider - {} REMOTE:{}", provider, request.getRemoteAddress());
+            }
+        }
+        if (credentials != null) {
+            LOG.info("auth success - {} REMOTE:{}", credentials, request.getRemoteAddress());
+            return true;
+        } else {
+            LOG.info("auth fail ! - REMOTE:{}", request.getRemoteAddress());
+            return false;
+        }
+    }
 }

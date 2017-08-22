@@ -1,134 +1,79 @@
 package org.elasticsearch.plugin.elasticfence;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-
+import com.google.common.collect.ImmutableList;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.plugin.elasticfence.logger.EFLogger;
-
+import org.elasticsearch.common.util.concurrent.ThreadContext;
+import org.elasticsearch.plugin.elasticfence.provider.AuthProvider;
+import org.elasticsearch.plugin.elasticfence.provider.InMemoryAuthProvider;
+import org.elasticsearch.plugin.elasticfence.provider.LdapAuthProvider;
 import org.elasticsearch.plugins.ActionPlugin;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.rest.RestHandler;
 
+import java.util.Arrays;
+import java.util.List;
+import java.util.function.UnaryOperator;
+
+import static org.elasticsearch.plugin.elasticfence.Constants.*;
+
 public class ElasticfencePlugin extends Plugin implements ActionPlugin {
-	private final Settings settings;
+    private final static Logger LOG = LogManager.getLogger(ElasticfencePlugin.class);
 
-	public ElasticfencePlugin(Settings settings){
-		this.settings = settings;
-		EFLogger.info("loading elasticfence plugin...");
-	}
+    private final Settings settings;
 
-	@Override
-	public List<Class<? extends RestHandler>> getRestHandlers() {
-        try {
-            String isPluginDisabled = getSettingString("disabled");
+    @Inject
+    public ElasticfencePlugin(Settings settings) {
+        this.settings = settings;
+        LOG.info("loading elasticfence plugin...");
+    }
 
-            if (isPluginDisabled != null && "true".equals(isPluginDisabled)) {
-                EFLogger.warn("Elasticfence plugin is disabled");
-            } else {
-                String rootPassword = getSettingString("root.password");
-                if (rootPassword != null && !"".equals(rootPassword)) {
-                    UserAuthenticator.setRootPassword(rootPassword);
-                    UserAuthenticator.loadRootUserDataCacheOnStart();
-                }
+    @Override
+    public UnaryOperator<RestHandler> getRestHandlerWrapper(ThreadContext threadContext) {
+        Settings pluginSettings = settings.getByPrefix(SETTINGS_PREFIX);
+        if (!pluginSettings.getAsBoolean(SETTINGS_ENABLED, false)) {
+            LOG.warn("elasticfence plugin is disabled");
+            return null;
+        }
 
-                String[] whitelist = getSettingArray("whitelist", new String[]{"127.0.0.1"});
-                String[] blacklist = getSettingArray("blacklist", new String[]{});
-
-                if (whitelist != null) {
-                    IPAuthenticator.setWhitelist(whitelist);
-                    EFLogger.warn("elasticfence plugin IP whitelist enabled " + Arrays.toString(whitelist));
-                }
-                if (blacklist != null) {
-                    IPAuthenticator.setBlacklist(blacklist);
-                    EFLogger.warn("elasticfence plugin IP blacklist enabled " + Arrays.toString(blacklist));
-                }
-
-                ElasticfenceSettings.SETTING_AUTH_NUMBER_OF_SHARDS = getSettingInt("number_of_shards", ElasticfenceSettings.SETTING_AUTH_NUMBER_OF_SHARDS_DEFAULT);
-                ElasticfenceSettings.SETTING_AUTH_NUMBER_OF_REPLICAS = getSettingInt("number_of_replicas", ElasticfenceSettings.SETTING_AUTH_NUMBER_OF_REPLICAS_DEFAULT);
-
-                EFLogger.info("auth index number of shards set to " + ElasticfenceSettings.SETTING_AUTH_NUMBER_OF_SHARDS);
-                EFLogger.info("auth index number of replicas set to " + ElasticfenceSettings.SETTING_AUTH_NUMBER_OF_REPLICAS);
-
-                EFLogger.info("elasticfence plugin is enabled");
-                return Collections.singletonList(AuthRestHandler.class);
+        List<AuthProvider> authProviders = ImmutableList.<AuthProvider>builder()
+                .add(InMemoryAuthProvider.getInstance())
+                .add(LdapAuthProvider.getInstance())
+                .build();
+        for (AuthProvider provider : authProviders) {
+            try {
+                provider.init(pluginSettings);
+            } catch (Exception e) {
+                throw new IllegalStateException("error occurred during initialization of elasticfence !", e);
             }
-        } catch (Exception e) {
-            EFLogger.error("Error occurred during initialization of Elasticfence!", e);
         }
 
-        return Collections.emptyList();
-	}
-
-	private String getSettingString(String key) throws Exception {
-        Settings s = settings.getByPrefix(ElasticfenceSettings.SETTINGS_PREFIX);
-        String value = s.get(key);
-
-		//EFLogger.info(SETTINGS_PREFIX + key + " value: " + value);
-
-		if (value == null) {
-			throw new Exception(key + " is not defined in settings!");
-		}
-
-		return value;
-	}
-
-    private int getSettingInt(String key, int defaultValue) throws Exception {
-        Settings s = settings.getByPrefix(ElasticfenceSettings.SETTINGS_PREFIX);
-        int value = s.getAsInt(key, defaultValue);
-
-        if (value == defaultValue) {
-            EFLogger.warn(key + " is set to the default value of " +  defaultValue);
-        }
-
-        return value;
-    }
-
-	private String[] getSettingArray(String key, String[] defaultValue) throws Exception {
-        Settings s = settings.getByPrefix(ElasticfenceSettings.SETTINGS_PREFIX);
-        String[] value = s.getAsArray(key, defaultValue);
-
-        if (value == null || value.length == 0) {
-            EFLogger.warn(key + " is not defined in settings, setting default value of " +  Arrays.toString(defaultValue));
-            return defaultValue;
-        }
-
-        //EFLogger.info(key + ": " + Arrays.toString(value));
-        return value;
-	}
-
-    private Setting<Boolean> asBoolean(String name) {
-        return Setting.boolSetting(name, Boolean.FALSE, Setting.Property.NodeScope);
-    }
-
-    private Setting<String> asString(String name) {
-        return new Setting<>(name, "", (value) -> value, Setting.Property.NodeScope);
-    }
-
-    private Setting<List<String>> asList(String name){
-        return Setting.listSetting(name, new ArrayList<>(), s -> s.toString(), Setting.Property.NodeScope);
-    }
-
-    private Setting<Integer> asInt(String name, int defaultValue) {
-        return Setting.intSetting(name, defaultValue, Setting.Property.NodeScope);
+        LOG.info("elasticfence plugin is enabled");
+        return restHandler -> new AuthRestHandler(restHandler, authProviders);
     }
 
     @Override
     public List<Setting<?>> getSettings() {
-        String rootPrefix = "root.";
-
         return Arrays.asList(
-                asBoolean(ElasticfenceSettings.SETTINGS_PREFIX + "disabled"),
-                asString(ElasticfenceSettings.SETTINGS_PREFIX + rootPrefix + "password"),
-                asList(ElasticfenceSettings.SETTINGS_PREFIX + "whitelist"),
-                asList(ElasticfenceSettings.SETTINGS_PREFIX + "blacklist"),
-                asInt(ElasticfenceSettings.SETTINGS_PREFIX + "number_of_shards", ElasticfenceSettings.SETTING_AUTH_NUMBER_OF_SHARDS_DEFAULT),
-                asInt(ElasticfenceSettings.SETTINGS_PREFIX + "number_of_replicas", ElasticfenceSettings.SETTING_AUTH_NUMBER_OF_REPLICAS_DEFAULT)
+                Setting.boolSetting(SETTINGS_PREFIX + SETTINGS_ENABLED, Boolean.FALSE, Setting.Property.NodeScope),
+                Setting.simpleString(SETTINGS_PREFIX + SETTINGS_ROOT_USERNAME, Setting.Property.NodeScope),
+                Setting.simpleString(SETTINGS_PREFIX + SETTINGS_ROOT_PASSWORD, Setting.Property.NodeScope),
+                Setting.boolSetting(SETTINGS_PREFIX + SETTINGS_LDAP_ENABLED, Boolean.FALSE, Setting.Property.NodeScope),
+                Setting.simpleString(SETTINGS_PREFIX + SETTINGS_LDAP_HOST, Setting.Property.NodeScope),
+                Setting.intSetting(SETTINGS_PREFIX + SETTINGS_LDAP_PORT, 389, Setting.Property.NodeScope),
+                Setting.boolSetting(SETTINGS_PREFIX + SETTINGS_LDAP_SSL, Boolean.FALSE, Setting.Property.NodeScope),
+                Setting.simpleString(SETTINGS_PREFIX + SETTINGS_LDAP_BIND_DN, Setting.Property.NodeScope),
+                Setting.simpleString(SETTINGS_PREFIX + SETTINGS_LDAP_BIND_PASSWORD, Setting.Property.NodeScope),
+                Setting.simpleString(SETTINGS_PREFIX + SETTINGS_LDAP_USER_BASE, Setting.Property.NodeScope),
+                Setting.simpleString(SETTINGS_PREFIX + SETTINGS_LDAP_USER_FILTER, Setting.Property.NodeScope),
+                Setting.simpleString(SETTINGS_PREFIX + SETTINGS_LDAP_GROUP_BASE, Setting.Property.NodeScope),
+                Setting.simpleString(SETTINGS_PREFIX + SETTINGS_LDAP_GROUP_FILTER, Setting.Property.NodeScope),
+                Setting.simpleString(SETTINGS_PREFIX + SETTINGS_LDAP_GROUP_CN, Setting.Property.NodeScope),
+                Setting.boolSetting(SETTINGS_PREFIX + SETTINGS_LDAP_CACHE_ENABLED, Boolean.FALSE, Setting.Property.NodeScope),
+                Setting.intSetting(SETTINGS_PREFIX + SETTINGS_LDAP_CACHE_EXPIRE_SECONDS, 3600, Setting.Property.NodeScope)
         );
     }
 }
-
-
